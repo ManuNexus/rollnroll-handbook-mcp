@@ -99,17 +99,32 @@ async function startHttpServer() {
   const app = express();
   app.use(cors());
 
-  // Almacenar transportes activos por session id
-  const transports = new Map<string, SSEServerTransport>();
-
-  // Health check para Cloud Run
+  // Health check público para Cloud Run
   app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', service: 'rollnroll-handbook-mcp' });
   });
 
+  // Middleware de Autenticación mediante Shared Secret Token
+  app.use((req, res, next) => {
+    const expectedToken = process.env.MCP_AUTH_TOKEN;
+    if (!expectedToken) {
+      return next(); // Si no hay token configurado, pasa sin auth
+    }
+
+    const authHeader = req.headers.authorization || (req.headers['x-api-key'] as string);
+    if (authHeader !== `Bearer ${expectedToken}` && authHeader !== expectedToken) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid or missing authorization header' });
+    }
+
+    next();
+  });
+
+  // Almacenar transportes activos por session id
+  const transports = new Map<string, SSEServerTransport>();
+
   // Endpoint SSE para Latitude MCP
   app.get('/sse', async (req, res) => {
-    console.log('New SSE connection from Latitude/Client');
+    console.log('New authenticated SSE connection from Latitude');
     const transport = new SSEServerTransport('/messages', res);
     const server = createMcpServer();
 
