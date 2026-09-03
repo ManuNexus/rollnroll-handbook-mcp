@@ -3,9 +3,18 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const LATITUDE_API_KEY = process.env.LATITUDE_API_KEY || 'eaad4b99-b431-4000-82eb-505601848276';
+// Nunca poner credenciales en el código: se leen del entorno (Secret Manager en Cloud Run).
+const LATITUDE_API_KEY = process.env.LATITUDE_API_KEY;
 const LATITUDE_PROJECT_ID = process.env.LATITUDE_PROJECT_ID || '26842';
 const GATEWAY_URL = process.env.LATITUDE_GATEWAY_URL || 'https://gateway.latitude.so/api/v3';
+const REQUEST_TIMEOUT_MS = Number(process.env.LATITUDE_TIMEOUT_MS || 15_000);
+
+function authHeaders() {
+  if (!LATITUDE_API_KEY) {
+    throw new Error('LATITUDE_API_KEY is not set');
+  }
+  return { Authorization: `Bearer ${LATITUDE_API_KEY}` };
+}
 
 // Cache en memoria para evitar latencias de red en cada clip
 interface CacheEntry {
@@ -26,7 +35,8 @@ async function getLatestVersionUuid(): Promise<string> {
   }
 
   const res = await axios.get(`${GATEWAY_URL}/projects/${LATITUDE_PROJECT_ID}/versions`, {
-    headers: { Authorization: `Bearer ${LATITUDE_API_KEY}` }
+    headers: authHeaders(),
+    timeout: REQUEST_TIMEOUT_MS
   });
 
   const versions = res.data;
@@ -56,7 +66,8 @@ export async function fetchHandbookDocument(documentPath: string): Promise<strin
   const url = `${GATEWAY_URL}/projects/${LATITUDE_PROJECT_ID}/versions/${versionUuid}/documents/${documentPath}`;
 
   const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${LATITUDE_API_KEY}` }
+    headers: authHeaders(),
+    timeout: REQUEST_TIMEOUT_MS
   });
 
   let content: string = res.data?.content || '';
