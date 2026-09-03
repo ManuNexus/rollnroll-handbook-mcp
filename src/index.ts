@@ -1,7 +1,8 @@
-import express from 'express';
+import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { fetchHandbookDocument } from './latitude.js';
@@ -94,92 +95,160 @@ function createMcpServer() {
   return server;
 }
 
+/**
+ * Serves one JSON-RPC request over the Streamable HTTP transport in *stateless* mode.
+ *
+ * Stateless is the whole point: a fresh McpServer + transport is built for this single
+ * request and torn down with it, so nothing is kept in the instance's memory between
+ * requests. Cloud Run is therefore free to route every request to any instance it likes,
+ * and there is no long-lived request that can hit the 300s request timeout.
+ *
+ * The previous SSE-only design could not survive that: the session lived in a per-instance
+ * Map, while the client's POSTs were load-balanced across instances, so most of them
+ * answered "404 Session not found".
+ */
+async function handleStatelessRequest(req: Request, res: Response) {
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
+  res.on('close', () => {
+    void transport.close();
+    void server.close();
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('Error handling stateless MCP request:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null
+      });
+    }
+  }
+}
+
 // Iniciar servidor según el entorno (Cloud Run / SSE vs Stdio)
 async function startHttpServer() {
   const app = express();
-  app.use(cors());
+  app.use(cors({ exposedHeaders: ['Mcp-Session-Id'] }));
+  app.use(express.json({ limit: '4mb' }));
 
   // Health check público para Cloud Run
   app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', service: 'rollnroll-handbook-mcp' });
   });
 
-  // Almacenar transportes activos por session id
-  const transports = new Map<string, SSEServerTransport>();
-  const sessionTimers = new Map<string, NodeJS.Timeout>();
-
-  // Endpoint SSE para Latitude MCP
-  app.get('/sse', async (req, res) => {
-    console.log(`[${new Date().toISOString()}] New SSE connection from Latitude`);
-    
-    // Validar token solo en la conexión inicial si está configurado
+  // Middleware de Autenticación mediante Shared Secret Token
+  app.use((req, res, next) => {
     const expectedToken = process.env.MCP_AUTH_TOKEN;
-    if (expectedToken) {
-      const authHeader = req.headers.authorization || (req.headers['x-api-key'] as string);
-      const queryToken = req.query.token as string;
-      if (
-        authHeader !== `Bearer ${expectedToken}` &&
-        authHeader !== expectedToken &&
-        queryToken !== expectedToken
-      ) {
-        console.warn(`[${new Date().toISOString()}] SSE connection rejected: Invalid or missing token`);
-        return res.status(401).json({ error: 'Unauthorized: Invalid or missing authorization token' });
-      }
+    if (!expectedToken) {
+      return next(); // Si no hay token configurado, pasa sin auth
     }
 
+    const authHeader = req.headers.authorization || (req.headers['x-api-key'] as string);
+    const queryToken = req.query.token as string | undefined;
+    if (
+      authHeader !== `Bearer ${expectedToken}` &&
+      authHeader !== expectedToken &&
+      queryToken !== expectedToken
+    ) {
+      console.warn(`Rejected ${req.method} ${req.path}: invalid or missing token`);
+      return res.status(401).json({ error: 'Unauthorized: Invalid or missing authorization token' });
+    }
+
+    next();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Streamable HTTP (recomendado) — sin estado, seguro con cualquier número de
+  // instancias de Cloud Run. Este es el endpoint que debe usar Latitude.
+  // ---------------------------------------------------------------------------
+  app.post(['/mcp', '/'], handleStatelessRequest);
+
+  // En modo stateless no hay stream iniciado por el servidor ni sesión que borrar.
+  const methodNotAllowed = (_req: Request, res: Response) => {
+    res.status(405).set('Allow', 'POST').json({
+      jsonrpc: '2.0',
+      error: {
+        code: -32000,
+        message: 'Method not allowed. This endpoint is stateless: send JSON-RPC over POST /mcp.'
+      },
+      id: null
+    });
+  };
+  app.get('/mcp', methodNotAllowed);
+  app.delete('/mcp', methodNotAllowed);
+
+  // ---------------------------------------------------------------------------
+  // Legacy HTTP+SSE (protocolo 2024-11-05). Se mantiene sólo por compatibilidad.
+  //
+  // ATENCIÓN: la sesión vive en la memoria de *esta* instancia, así que sólo
+  // funciona si el servicio corre con una única instancia (o si el cliente
+  // devuelve la cookie de afinidad de sesión de Cloud Run, cosa que Latitude no
+  // hace). Los clientes nuevos deben usar POST /mcp.
+  // ---------------------------------------------------------------------------
+  const transports = new Map<string, SSEServerTransport>();
+  const SSE_KEEPALIVE_MS = 25_000;
+
+  app.get('/sse', async (req, res) => {
+    console.log('New authenticated SSE connection (legacy transport)');
     const transport = new SSEServerTransport('/messages', res);
     const server = createMcpServer();
 
     await server.connect(transport);
-    
-    // Limpiar cualquier timer previo si existía
-    if (sessionTimers.has(transport.sessionId)) {
-      clearTimeout(sessionTimers.get(transport.sessionId)!);
-      sessionTimers.delete(transport.sessionId);
-    }
-    
     transports.set(transport.sessionId, transport);
-    console.log(`[${new Date().toISOString()}] Session registered: ${transport.sessionId}`);
+
+    // Evita que proxies intermedios corten un stream inactivo.
+    const keepAlive = setInterval(() => res.write(': keepalive\n\n'), SSE_KEEPALIVE_MS);
 
     req.on('close', () => {
-      console.log(`[${new Date().toISOString()}] SSE socket disconnected: ${transport.sessionId} (grace period started)`);
-      // Dar un margen de 10 minutos antes de limpiar la sesión para que los POST /messages sigan funcionando
-      const timer = setTimeout(() => {
-        console.log(`[${new Date().toISOString()}] Expiring session after grace period: ${transport.sessionId}`);
-        transports.delete(transport.sessionId);
-        sessionTimers.delete(transport.sessionId);
-      }, 10 * 60 * 1000);
-      
-      sessionTimers.set(transport.sessionId, timer);
+      clearInterval(keepAlive);
+      console.log(`SSE connection closed: ${transport.sessionId}`);
+      transports.delete(transport.sessionId);
+      void server.close();
     });
   });
 
-  // Endpoint para recibir mensajes/invocaciones de tools desde el cliente
   app.post('/messages', async (req, res) => {
-    const sessionId = req.query.sessionId as string;
+    const sessionId = req.query.sessionId as string | undefined;
+
+    // Sin sessionId no hay nada que enrutar: trátalo como Streamable HTTP.
+    if (!sessionId) {
+      return handleStatelessRequest(req, res);
+    }
+
     const transport = transports.get(sessionId);
 
     if (!transport) {
-      console.warn(`[${new Date().toISOString()}] POST /messages failed: Session ${sessionId} not found in memory`);
-      res.status(404).send('Session not found');
+      console.warn(
+        `Unknown SSE session ${sessionId}. This instance holds ${transports.size} session(s). ` +
+          'If the service runs more than one instance, the SSE stream is on another instance: use POST /mcp instead.'
+      );
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32001,
+          message:
+            'Session not found. The legacy SSE transport requires the POST to reach the same instance that holds the SSE stream. ' +
+            'Use the stateless POST /mcp endpoint instead.'
+        },
+        id: (req.body as any)?.id ?? null
+      });
       return;
     }
 
-    try {
-      await transport.handlePostMessage(req, res);
-    } catch (err: any) {
-      console.error(`[${new Date().toISOString()}] Error handling POST /messages for session ${sessionId}:`, err);
-      if (!res.headersSent) {
-        res.status(500).send(err?.message || 'Internal Server Error');
-      }
-    }
+    await transport.handlePostMessage(req, res, req.body);
   });
 
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => {
     console.log(`🚀 RollnRoll Handbook MCP Server running on port ${PORT}`);
-    console.log(`📡 SSE Endpoint: http://localhost:${PORT}/sse`);
-    console.log(`📨 Message Endpoint: http://localhost:${PORT}/messages`);
+    console.log(`📡 Streamable HTTP endpoint (recommended): POST http://localhost:${PORT}/mcp`);
+    console.log(`📨 Legacy SSE endpoint (single-instance only): GET http://localhost:${PORT}/sse`);
   });
 }
 
