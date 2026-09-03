@@ -104,36 +104,53 @@ async function startHttpServer() {
     res.status(200).json({ status: 'ok', service: 'rollnroll-handbook-mcp' });
   });
 
-  // Middleware de Autenticación mediante Shared Secret Token
-  app.use((req, res, next) => {
-    const expectedToken = process.env.MCP_AUTH_TOKEN;
-    if (!expectedToken) {
-      return next(); // Si no hay token configurado, pasa sin auth
-    }
-
-    const authHeader = req.headers.authorization || (req.headers['x-api-key'] as string);
-    if (authHeader !== `Bearer ${expectedToken}` && authHeader !== expectedToken) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid or missing authorization header' });
-    }
-
-    next();
-  });
-
   // Almacenar transportes activos por session id
   const transports = new Map<string, SSEServerTransport>();
+  const sessionTimers = new Map<string, NodeJS.Timeout>();
 
   // Endpoint SSE para Latitude MCP
   app.get('/sse', async (req, res) => {
-    console.log('New authenticated SSE connection from Latitude');
+    console.log(`[${new Date().toISOString()}] New SSE connection from Latitude`);
+    
+    // Validar token solo en la conexión inicial si está configurado
+    const expectedToken = process.env.MCP_AUTH_TOKEN;
+    if (expectedToken) {
+      const authHeader = req.headers.authorization || (req.headers['x-api-key'] as string);
+      const queryToken = req.query.token as string;
+      if (
+        authHeader !== `Bearer ${expectedToken}` &&
+        authHeader !== expectedToken &&
+        queryToken !== expectedToken
+      ) {
+        console.warn(`[${new Date().toISOString()}] SSE connection rejected: Invalid or missing token`);
+        return res.status(401).json({ error: 'Unauthorized: Invalid or missing authorization token' });
+      }
+    }
+
     const transport = new SSEServerTransport('/messages', res);
     const server = createMcpServer();
 
     await server.connect(transport);
+    
+    // Limpiar cualquier timer previo si existía
+    if (sessionTimers.has(transport.sessionId)) {
+      clearTimeout(sessionTimers.get(transport.sessionId)!);
+      sessionTimers.delete(transport.sessionId);
+    }
+    
     transports.set(transport.sessionId, transport);
+    console.log(`[${new Date().toISOString()}] Session registered: ${transport.sessionId}`);
 
     req.on('close', () => {
-      console.log(`SSE connection closed: ${transport.sessionId}`);
-      transports.delete(transport.sessionId);
+      console.log(`[${new Date().toISOString()}] SSE socket disconnected: ${transport.sessionId} (grace period started)`);
+      // Dar un margen de 10 minutos antes de limpiar la sesión para que los POST /messages sigan funcionando
+      const timer = setTimeout(() => {
+        console.log(`[${new Date().toISOString()}] Expiring session after grace period: ${transport.sessionId}`);
+        transports.delete(transport.sessionId);
+        sessionTimers.delete(transport.sessionId);
+      }, 10 * 60 * 1000);
+      
+      sessionTimers.set(transport.sessionId, timer);
     });
   });
 
@@ -143,11 +160,19 @@ async function startHttpServer() {
     const transport = transports.get(sessionId);
 
     if (!transport) {
+      console.warn(`[${new Date().toISOString()}] POST /messages failed: Session ${sessionId} not found in memory`);
       res.status(404).send('Session not found');
       return;
     }
 
-    await transport.handlePostMessage(req, res);
+    try {
+      await transport.handlePostMessage(req, res);
+    } catch (err: any) {
+      console.error(`[${new Date().toISOString()}] Error handling POST /messages for session ${sessionId}:`, err);
+      if (!res.headersSent) {
+        res.status(500).send(err?.message || 'Internal Server Error');
+      }
+    }
   });
 
   const PORT = process.env.PORT || 8080;
