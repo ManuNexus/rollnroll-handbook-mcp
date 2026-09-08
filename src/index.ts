@@ -5,7 +5,16 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { fetchHandbookDocument } from './latitude.js';
+import { HANDBOOKS_DATA } from './data/handbooks.js';
+
+export function getHandbook(path: string): string {
+  const normalized = path.toLowerCase().trim();
+  const content = HANDBOOKS_DATA[normalized];
+  if (!content) {
+    throw new Error(`Handbook not found for path: ${path}`);
+  }
+  return content;
+}
 
 export const CATEGORIES = [
   'business',
@@ -43,7 +52,7 @@ function createMcpServer() {
 
   server.tool(
     'get_content_handbooks',
-    'Fetches and unifies category and format extraction handbooks dynamically from Latitude for video content segmentation.',
+    'Fetches and unifies category and format extraction handbooks for video content segmentation.',
     {
       category: z.enum(CATEGORIES).describe('The detected primary category/niche of the video (e.g. gaming, business, comedy)'),
       format: z.enum(FORMATS).describe('The detected structural format of the video (e.g. gameplay, podcast, reaction, tutorial)')
@@ -53,10 +62,8 @@ function createMcpServer() {
         const categoryPath = `handbooks/category/${category.toLowerCase()}`;
         const formatPath = `handbooks/format/${format.toLowerCase()}`;
 
-        const [categoryContent, formatContent] = await Promise.all([
-          fetchHandbookDocument(categoryPath),
-          fetchHandbookDocument(formatPath)
-        ]);
+        const categoryContent = getHandbook(categoryPath);
+        const formatContent = getHandbook(formatPath);
 
         const combinedMarkdown = [
           `# CONTENT HANDBOOKS: ${category.toUpperCase()} / ${format.toUpperCase()}`,
@@ -85,6 +92,37 @@ function createMcpServer() {
             {
               type: 'text',
               text: `Error fetching handbooks for category "${category}" and format "${format}": ${err?.message || err}`
+            }
+          ]
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'get_handbook',
+    'Fetches a specific handbook document by its full path (e.g. "handbooks/piece/clips", "handbooks/clip-duration/short", "handbooks/category/gaming").',
+    {
+      path: z.string().describe('The full relative path of the handbook to retrieve (e.g. handbooks/piece/clips, handbooks/clip-duration/short, handbooks/category/gaming, handbooks/format/gameplay).')
+    },
+    async ({ path }) => {
+      try {
+        const content = getHandbook(path);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: content
+            }
+          ]
+        };
+      } catch (err: any) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Error fetching handbook "${path}": ${err?.message || err}`
             }
           ]
         };

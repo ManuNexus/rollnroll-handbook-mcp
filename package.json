@@ -1,7 +1,7 @@
 {
   "name": "rollnroll-handbook-mcp",
   "version": "1.0.0",
-  "description": "MCP Server for retrieving and combining RollnRoll category and format handbooks dynamically from Latitude",
+  "description": "MCP Server for fast in-memory retrieval and combining of RollnRoll category, format, duration and piece handbooks",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
