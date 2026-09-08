@@ -99,37 +99,6 @@ function createMcpServer() {
     }
   );
 
-  server.tool(
-    'get_handbook',
-    'Fetches a specific handbook document by its full path (e.g. "handbooks/piece/clips", "handbooks/clip-duration/short", "handbooks/category/gaming").',
-    {
-      path: z.string().describe('The full relative path of the handbook to retrieve (e.g. handbooks/piece/clips, handbooks/clip-duration/short, handbooks/category/gaming, handbooks/format/gameplay).')
-    },
-    async ({ path }) => {
-      try {
-        const content = getHandbook(path);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: content
-            }
-          ]
-        };
-      } catch (err: any) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `Error fetching handbook "${path}": ${err?.message || err}`
-            }
-          ]
-        };
-      }
-    }
-  );
-
   return server;
 }
 
